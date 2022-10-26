@@ -1,0 +1,344 @@
+---
+title: "Churn"
+author  : "Nicole An"
+date    : "`r Sys.Date()`" 
+output: 
+  github_document
+---
+
+
+## Library
+```{r,warning=FALSE}
+library(tidymodels)
+library(tidyverse)
+library(janitor)
+library(vip)
+
+options(yardstick.event_first = FALSE)
+```
+
+## Customer Churn
+
+```{r,warning=FALSE}
+churn_train <- read_csv("churn_training.csv") %>% clean_names()
+
+churn_kaggle <- read_csv("churn_holdout.csv") %>% clean_names()
+
+churn_train
+```
+## Scatter Plot 
+
+```{r,warning=FALSE}
+#1 = churned, 0 = didn't churn
+churn_train %>%
+  ggplot(aes(x=monthly_minutes,y=total_billed, color=churn)) +
+  geom_point() +
+  labs(title="monthly_minutes vs total_billed", x="monthly_minutes", y="total_billed")
+```
+
+
+## 2. explore target
+
+```{r,warning=FALSE}
+churn_summary <- churn_train %>%
+  count(churn) %>%
+  mutate(pct = n/sum(n))
+
+
+churn_summary %>%
+  ggplot(aes(x=factor(churn),y=pct)) +
+  geom_col()  + 
+  geom_text(aes(label = paste(round(pct*100,1),"%")), vjust = 1.2, colour = "white") + 
+  labs(title="Customer Churns", x="Churn", y="PCT")
+```
+
+
+## 3. Explore your data 
+```{r}
+churn_train %>% skimr::skim_without_charts()
+```
+
+
+```{r,warning=FALSE}
+
+churn_vis <- churn_train %>% 
+  mutate(churn = as.factor(churn) ) %>%
+   mutate_if(is.character, factor) 
+churn_vis %>% head()
+
+
+cnames <- c("monthly_minutes","customer_service_calls","streaming_minutes","total_billed","prev_balance",	"late_payments",	"customer_reg_date",	"partner",	"phone_service","multiple_lines",	"streaming_plan",	"mobile_hotspot",	"wifi_calling_text",	"online_backup",	"device_protection",	"number_phones",	"paperless_billing",	"payment_method",	"gender",	"network_speed",	"senior_citizen")
+
+for (c in cnames) {
+  if (c %in% names(churn_vis %>% select_if(is.factor))) {
+    # -- for each character column create a chart
+    print( churn_vis %>%
+             ggplot(., aes(!!as.name(c))) + 
+             geom_bar(aes(fill = churn), position = "fill")  +labs(title = c))
+  } else {
+    # -- comparative boxplots
+    print(ggplot(churn_vis, aes(x=churn, y=!!as.name(c), fill=churn))+ geom_boxplot() +labs(title = c))
+  }
+}
+
+```
+
+## 4. Transform 
+Convert categories to factors 
+
+```{r}
+churn_train_prep <- churn_train %>% 
+  mutate(churn = as.factor(churn) ) %>%
+   mutate_if(is.character, factor) 
+churn_train_prep %>% head()
+```
+## 5. Partition your data into 80/20 train/test split 
+
+```{r}
+set.seed(123)
+x <- initial_split(churn_train_prep, prop = 0.8, strata = churn)
+train <- training(x)
+test  <- testing(x)
+
+sprintf("Train PCT : %1.2f%%", nrow(train)/ nrow(churn_train_prep) * 100)
+sprintf("Test  PCT : %1.2f%%", nrow(test)/ nrow(churn_train_prep) * 100)
+```
+
+## 6. Define your Model(s)
+
+```{r}
+knn_model <- nearest_neighbor(neighbors = 12) %>%
+  set_mode("classification") %>%
+  set_engine("kknn")
+
+tree_model <- decision_tree(tree_depth = 10, min_n=3, cost_complexity = 0.003433367			) %>%
+  set_mode("classification") %>%
+  set_engine("rpart")
+
+logistic_model <- logistic_reg() %>%
+  set_mode("classification") %>%
+  set_engine("glm")
+```
+
+
+## 7. Define Recipe 
+1. what are the variables we want to include, this will be used to create our formula 
+2. what transformation steps do we need to add? 
+  - missing values 
+  - scaling 
+  - one-hot-encoding 
+3. peak at the result 
+```{r}
+knn_recipe <- recipe(churn ~ monthly_minutes + customer_service_calls + streaming_minutes + total_billed + prev_balance + late_payments + partner + streaming_plan + mobile_hotspot + wifi_calling_text + number_phones + currency_code + paperless_billing + payment_method,
+                     data=train) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_scale(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) 
+
+# eyeball recipe results 
+bake(knn_recipe %>% prep(), train,  composition = "tibble") %>% head()
+```
+
+
+### Modify the complexity parameter in rpart
+
+```{r}
+set.seed(123)
+library(caret)
+treemod2 <- train(churn ~ monthly_minutes + customer_service_calls + streaming_minutes + total_billed + prev_balance + late_payments + streaming_plan + number_phones + paperless_billing+payment_method,
+                     data=train,
+  method="rpart",
+  trControl = trainControl("cv", number = 100),
+  tuneLength=10,na.action = na.omit)
+
+plot(treemod2)
+treemod2$bestTune
+```
+
+
+### Stepwise logistic model
+
+```{r}
+library(MASS)
+steplog <- glm(churn ~ monthly_minutes + customer_service_calls + streaming_minutes + total_billed + prev_balance + late_payments + billing_state + partner + phone_service + multiple_lines + streaming_plan + mobile_hotspot + device_protection + number_phones + paperless_billing + payment_method + network_speed + senior_citizen,
+                     data=na.omit(train),  family=binomial(link="logit")) 
+
+step <- stepAIC(steplog,direction="both")
+summary(step)
+
+
+```
+
+### Use tidymodel framework to fit reduced model
+```{r}
+
+churn_redrecipe <- recipe(churn ~ monthly_minutes + 
+    streaming_minutes + total_billed + prev_balance + late_payments + 
+     partner + phone_service + multiple_lines + 
+    streaming_plan + mobile_hotspot + wifi_calling_text + number_phones + currency_code + paperless_billing + payment_method, data = train) %>%
+  step_impute_mode(all_nominal(), -all_outcomes()) %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  step_impute_median(all_numeric()) %>%
+  prep()
+
+bake(churn_redrecipe %>% prep(), train,  composition = "tibble") %>% head()
+
+```
+## 8. Apply recipe and model
+```{r}
+knn_workflow <- workflow() %>%
+  add_recipe(knn_recipe) %>%
+  add_model(knn_model) %>%
+  fit(train)
+
+tree_workflow <- workflow() %>%
+  add_recipe(knn_recipe) %>%
+  add_model(tree_model) %>%
+  fit(train)
+
+logistic_workflow <- workflow() %>%
+  add_recipe(churn_redrecipe) %>%
+  add_model(logistic_model) %>%
+  fit(train)
+```
+
+
+## 9. Evaluate models
+```{r}
+
+#1 = churned, 0 = didn't churn. use .pred_1 
+
+predict_and_eval <- function(workflow_fit){
+  scored_train <- predict(workflow_fit, train, type="prob") %>%
+    bind_cols(predict(workflow_fit, train, type="class")) %>%
+    bind_cols(.,train) 
+
+  scored_test <- predict(workflow_fit, test, type="prob") %>%
+    bind_cols(predict(workflow_fit, test, type="class")) %>%
+    bind_cols(.,test)
+
+  # -- Metrics: Train and Test 
+  metrics <- scored_train %>% 
+    metrics(truth = churn, 
+            predicted = .pred_1, 
+            estimate = .pred_class) %>%
+    mutate(part="training") %>%
+    bind_rows( scored_test %>% 
+                  metrics(truth = churn, 
+            predicted = .pred_1, 
+            estimate = .pred_class) %>%
+                 mutate(part="testing") ) %>%
+    filter(.metric %in% c('accuracy','roc_auc')) %>%
+    pivot_wider(names_from = .metric, values_from=.estimate)
+  
+  # -- precision and recall
+  precision <- scored_train %>%
+  yardstick::precision(churn, .pred_class) %>%
+  mutate(part="training") %>%
+  bind_rows(
+  scored_test %>%
+  yardstick::precision(churn, .pred_class) %>%
+    mutate(part="testing") 
+  )
+  recall <- scored_train %>%
+  yardstick::recall(churn, .pred_class) %>%
+  mutate(part="training") %>%
+  bind_rows(
+  scored_test %>%
+  yardstick::recall(churn, .pred_class) %>%
+    mutate(part="testing") 
+  )
+
+  # -- ROC Charts 
+  roc_chart <- scored_train %>%
+  mutate(model = "train") %>%
+  bind_rows(scored_test %>%
+              mutate(model="test")) %>%
+  group_by(model) %>%
+  roc_curve(churn, .pred_1) %>%
+  autoplot()
+
+  # -- confusion matrix
+  conf_train <- scored_train %>%
+  conf_mat(
+  truth = churn,
+  estimate = .pred_class,
+  dnn = c("Prediction", "Truth")
+) %>%
+  autoplot(type = "heatmap") + 
+  labs(title="Training Confusion Matrix")
+
+  conf_test <- scored_test %>%
+  conf_mat(
+  truth = churn,
+  estimate = .pred_class,
+  dnn = c("Prediction", "Truth")
+) %>%
+  autoplot(type = "heatmap") + 
+  labs(title="Test Confusion Matrix")
+  
+  print(metrics)
+  print(precision)
+  print(recall)
+  print(roc_chart)
+  print(conf_train)
+  print(conf_test)
+}
+
+```
+
+### knn scores and evaluation
+```{r}
+predict_and_eval(knn_workflow)
+```
+
+### log regression scores and evaluation
+```{r}
+predict_and_eval(logistic_workflow)
+```
+### decision tree scores and evaluation
+```{r}
+predict_and_eval(tree_workflow)
+```
+
+
+### Logistic model performance & top 10 important variables
+
+```{r}
+
+logistic_workflow %>%
+ pull_workflow_fit() %>%
+  tidy() %>%
+  mutate_if(is.numeric,round,2)
+
+logistic_workflow %>%
+  pull_workflow_fit() %>%
+  vip()
+```
+
+
+
+## 10. Kaggle 
+
+```{r}
+ 
+#churn_kaggle <- churn_kaggle %>%
+#  mutate_if(is.character,factor)
+#
+## -- score testing 
+#scored_kaggle <- predict(knn_workflow,churn_kaggle, type="class") %>%
+#       bind_cols(., churn_kaggle) %>%
+#  select(customer_id, churn = .pred_class )
+#  
+#scored_kaggle %>%
+#  write_csv("my_kaggle_submission_2.csv")
+```
+
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
